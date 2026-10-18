@@ -26,6 +26,7 @@ def test_fdi_helpers():
     found, errors = agreement.parse_findings("36 DC; 48 I, 26c; 99 X; 11 periapical lesion")
     assert found == {(36, "Deep Caries"), (48, "Impacted"), (26, "Caries"), (11, "Periapical Lesion")}
     assert errors == ["99 X"]
+    assert agreement.parse_findings("none") == (set(), []) and agreement.parse_findings(" - ") == (set(), [])
 
 
 def test_pipeline():
