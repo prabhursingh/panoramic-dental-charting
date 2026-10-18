@@ -1,0 +1,14 @@
+# data and training outputs (DENTEX may not be redistributed here)
+dentex/
+dentex_raw/
+data/
+runs/
+*.pt
+*.zip
+dentist_study/
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/

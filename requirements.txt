@@ -1,0 +1,11 @@
+torch>=2.3
+torchvision>=0.18
+numpy
+pandas
+matplotlib
+pillow
+scikit-learn
+pycocotools
+huggingface_hub
+ipywidgets
+pytest
