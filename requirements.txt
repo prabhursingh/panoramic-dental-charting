@@ -8,4 +8,5 @@ scikit-learn
 pycocotools
 huggingface_hub
 ipywidgets
+streamlit
 pytest

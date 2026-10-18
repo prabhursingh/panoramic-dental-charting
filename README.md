@@ -120,6 +120,26 @@ the explanation check and the dentist study look at.
 
 **3. Explanation check** and **4. dentist vs AI** (50 blinded X-rays): *in progress.*
 
+## 🖥️ Try it on your own X-ray
+
+Part 6 of the notebook starts a small web dashboard (Streamlit, `app/dashboard.py`): upload a
+panoramic X-ray and get the tooth numbers, the findings and the dental chart. It is built for
+X-rays the models have not seen (`dentchart/infer.py`):
+
+- **Strict model loading.** A wrong path or file stops the dashboard with an error, and the page
+  shows which checkpoint it loaded. An early version silently kept untrained weights when the
+  path was wrong and still reported success: its output looked like detections but was noise.
+- **Scanner label strips are cropped:** dark or flat bands at the edges, with the machine name
+  and an "R" marker.
+- **Scale fit for crops, screenshots and other machines.** If the X-ray does not have the usual
+  OPG shape, or few teeth are found, it is also tried smaller, stretched to the usual shape and
+  with stretched contrast. The setting where the tooth model finds the most teeth is used and
+  reported.
+- **Only findings on a detected tooth are charted**, one per tooth and diagnosis.
+
+The notebook checks this on a DENTEX test X-ray and on a copy made to look like a screenshot
+(label band added, squeezed sideways). *Research use only: upload only anonymised X-rays.*
+
 ## 🚀 How to run
 
 **Colab (recommended, free GPU):** open [Google Colab](https://colab.research.google.com) →
@@ -133,6 +153,7 @@ results are saved to your Google Drive, and training resumes automatically if Co
 ```bash
 pip install -r requirements.txt
 python -m pytest tests -q          # end-to-end test on fake X-rays, CPU, about 5 minutes
+DENTCHART_MODEL_DIRS=/path/to/WORK streamlit run app/dashboard.py   # dashboard with your trained models
 ```
 
 ## 📁 Repository structure
@@ -147,7 +168,9 @@ python -m pytest tests -q          # end-to-end test on fake X-rays, CPU, about 
 │   ├── evaluate.py    # COCO AP and dental-chart metrics
 │   ├── explain.py     # HiResCAM / Grad-CAM for detections + crown/root plausibility check
 │   ├── agreement.py   # blinded dentist study: charting tool and agreement statistics
+│   ├── infer.py       # chart any X-ray: preparation, label-strip crop, scale fit
 │   └── viz.py         # X-rays with boxes, dental chart, heat-maps, study plots
+├── app/dashboard.py                        # web dashboard (Streamlit)
 ├── scripts/make_synthetic_dentex.py        # fake DENTEX download for testing
 └── tests/                                  # end-to-end and oracle tests
 ```
