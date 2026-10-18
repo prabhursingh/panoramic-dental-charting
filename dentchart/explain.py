@@ -1,8 +1,7 @@
 """Explanation check: does the model look at the right part of the tooth?
 
-For every finding the model detects correctly we compute a Grad-CAM heat-map for that
-detection (gradients of its score with respect to the FPN feature maps). We then ask a
-dental question of the heat-map:
+For every finding the model detects correctly we compute a heat-map for that detection and
+ask a dental question of it:
 
     caries / deep caries  -> evidence should lie in the CROWN half of the tooth
     periapical lesion     -> evidence should lie in the ROOT half (towards the apex)
@@ -10,6 +9,12 @@ dental question of the heat-map:
 On an OPG the upper teeth point down (crown at the bottom of the box, apex at the top)
 and the lower teeth point up, so "crown half" depends on the jaw (taken from the FDI
 number). Impacted teeth have no single expected region and are reported without a verdict.
+
+Heat-map method: HiResCAM (Draelos & Carin, 2020), a variant of Grad-CAM that multiplies
+gradients and feature maps location by location instead of averaging the gradients first.
+It shows where the evidence for one detection actually lies, and it does not go blank on
+feature maps that take negative values (as the FPN outputs of Faster R-CNN do), which plain
+Grad-CAM can. Grad-CAM is available as method="gradcam" for comparison.
 
 Note: in a two-stage detector the classifier only sees features inside the box, so the
 heat-map stays inside the box. The test is therefore about WHERE inside the tooth the
@@ -27,10 +32,11 @@ from .fdi import EXPECTED_REGION, is_upper
 
 
 class DetectionGradCAM:
-    """Grad-CAM for one detection of a torchvision Faster R-CNN."""
+    """HiResCAM (default) or Grad-CAM for one detection of a torchvision Faster R-CNN."""
 
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, model, method="hirescam"):
+        assert method in ("hirescam", "gradcam")
+        self.model, self.method = model, method
         self._feats, self._padded, self._resized = None, None, None
         self._hooks = [model.backbone.register_forward_hook(self._save_features),
                        model.transform.register_forward_hook(self._save_sizes)]
@@ -50,47 +56,58 @@ class DetectionGradCAM:
         for h in self._hooks:
             h.remove()
 
-    def __call__(self, image, box=None, label=None, min_iou=0.5):
-        """Heat-map (H, W) in [0, 1] for the detection that matches `box` and `label`.
+    def __call__(self, image, box=None, label=None, min_iou=0.5, min_score=0.0):
+        """Heat-map (H, W) in [0, 1] for the detection that best matches `box` and `label`.
 
-        If `box` is None the highest-scoring detection is explained.
-        Returns None when no matching detection exists.
+        Only detections with score >= min_score and IoU >= min_iou count. If `box` is None
+        the highest-scoring detection is explained. Returns None when nothing matches.
         """
         model = self.model
         model.eval()
         device = next(model.parameters()).device
         with torch.enable_grad():
             out = model([image.to(device)])[0]
-            if len(out["scores"]) == 0:
+            scores = out["scores"]
+            if len(scores) == 0:
                 return None
             k = 0
             if box is not None:
-                iou = box_iou(out["boxes"].detach(), torch.as_tensor(box, dtype=torch.float32, device=device)[None])[:, 0]
+                target = torch.as_tensor(np.asarray(box, dtype=np.float32), device=device).reshape(1, 4)
+                iou = box_iou(out["boxes"].detach(), target)[:, 0]
+                ok = scores.detach() >= min_score
                 if label is not None:
-                    iou = iou * (out["labels"] == int(label))
+                    ok = ok & (out["labels"] == int(label))
+                iou = torch.where(ok, iou, torch.zeros_like(iou))
                 k = int(iou.argmax())
                 if float(iou[k]) < min_iou:
                     return None
-            score = out["scores"][k]
+            score = scores[k]
             model.zero_grad(set_to_none=True)
             score.backward()
 
-        cam = None
+        maps = []
         for feat in self._feats.values():
             if feat.grad is None:
                 continue
-            weights = feat.grad[0].mean(dim=(1, 2))
-            level = torch.relu((weights[:, None, None] * feat[0].detach()).sum(0))
-            level = F.interpolate(level[None, None], size=self._padded, mode="bilinear", align_corners=False)[0, 0]
-            cam = level if cam is None else cam + level
-        if cam is None:
+            g, a = feat.grad[0], feat[0].detach()
+            if self.method == "gradcam":
+                maps.append((g.mean(dim=(1, 2))[:, None, None] * a).sum(0))
+            else:
+                maps.append((g * a).sum(0))
+        if not maps:
             return None
+        positive = [torch.relu(m) for m in maps]
+        fallback = sum(float(p.sum()) for p in positive) <= 0
+        if fallback:  # no positive evidence at all: show where the evidence is, whatever its sign
+            positive = [m.abs() for m in maps]
+        cam = sum(F.interpolate(p[None, None], size=self._padded, mode="bilinear", align_corners=False)[0, 0]
+                  for p in positive)
         h, w = self._resized
         cam = F.interpolate(cam[:h, :w][None, None], size=tuple(image.shape[-2:]), mode="bilinear",
                             align_corners=False)[0, 0]
         cam = (cam / (cam.max() + 1e-8)).detach().cpu().numpy()
-        return {"cam": cam, "box": out["boxes"][k].detach().cpu().numpy(),
-                "score": float(score.detach()), "label": int(out["labels"][k])}
+        return {"cam": cam, "box": out["boxes"][k].detach().cpu().numpy(), "score": float(score.detach()),
+                "label": int(out["labels"][k]), "fallback": fallback}
 
 
 def crown_root_split(cam, box, fdi):
@@ -113,37 +130,41 @@ def crown_root_split(cam, box, fdi):
             "peak_depth": float(depth[peak_row])}
 
 
-def explanation_check(model, ds, find_preds, score_thresh=0.3, iou_thresh=0.5, keep_maps=3, log=print):
+def explanation_check(model, ds, find_preds=None, score_thresh=0.3, iou_thresh=0.5, keep_maps=3,
+                      method="hirescam", log=print):
     """Run the anatomical plausibility test on all correctly detected findings of a dataset.
+
+    A finding counts as correctly detected when the model finds a box of the same diagnosis
+    with score >= score_thresh and IoU >= iou_thresh. find_preds (optional) only speeds things
+    up by skipping X-rays without any detection above the threshold.
 
     Returns (per_finding DataFrame, summary DataFrame, examples) where examples holds a few
     heat-maps per diagnosis for plotting.
     """
-    cammer = DetectionGradCAM(model)
+    cammer = DetectionGradCAM(model, method=method)
     rows, examples = [], {}
+    total = missed = empty = fallback = 0
     try:
-        for i, pred in enumerate(find_preds):
-            record = ds.records[i]
+        for i, record in enumerate(ds.records):
             gts = [a for a in record["anns"] if a["diagnosis"] in ds.diagnoses and a["fdi"]]
-            keep = pred["scores"] >= score_thresh
-            if not gts or not keep.any():
+            total += len(gts)
+            if not gts:
                 continue
-            boxes, labels = pred["boxes"][keep], pred["labels"][keep]
-            image = None
+            if find_preds is not None and not (find_preds[i]["scores"] >= score_thresh).any():
+                missed += len(gts)
+                continue
+            image = ds.image(i).unsqueeze(0).expand(3, -1, -1).contiguous()
             for a in gts:
                 label = ds.diagnoses.index(a["diagnosis"]) + 1
-                iou = box_iou(torch.as_tensor([a["box"]], dtype=torch.float32), torch.as_tensor(boxes))[0]
-                iou = iou * torch.as_tensor(labels == label)
-                if float(iou.max()) < iou_thresh:
-                    continue  # missed finding: nothing to explain
-                if image is None:
-                    image = ds.image(i).unsqueeze(0).expand(3, -1, -1).contiguous()
-                res = cammer(image, box=boxes[int(iou.argmax())], label=label)
+                res = cammer(image, box=a["box"], label=label, min_iou=iou_thresh, min_score=score_thresh)
                 if res is None:
+                    missed += 1  # not detected at this threshold: nothing to explain
                     continue
                 split = crown_root_split(res["cam"], a["box"], a["fdi"])
                 if split is None:
+                    empty += 1
                     continue
+                fallback += res["fallback"]
                 expected = EXPECTED_REGION.get(a["diagnosis"])
                 plausible = None
                 if expected == "crown":
@@ -159,9 +180,10 @@ def explanation_check(model, ds, find_preds, score_thresh=0.3, iou_thresh=0.5, k
                                "crown_share": split["crown_share"]})
     finally:
         cammer.remove()
+    log(f"Explained {len(rows)} of {total} true findings ({missed} not detected at score >= {score_thresh:.2f}, "
+        f"{empty} with an empty heat-map, {fallback} explained by gradient magnitude).")
     df = pd.DataFrame(rows)
     if df.empty:
-        log("No correctly detected findings to explain yet.")
         return df, pd.DataFrame(), examples
     summary = (df.groupby("diagnosis")
                  .agg(findings=("fdi", "size"), median_crown_share=("crown_share", "median"),

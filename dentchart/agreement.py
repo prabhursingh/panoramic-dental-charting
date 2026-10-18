@@ -7,7 +7,7 @@
 
 Chart format, one line per X-ray: FDI number + code, separated by ';'
     C = caries, DC = deep caries, PA = periapical lesion, I = impacted
-    e.g.  "36 DC; 48 I; 26 C"     (leave empty if no abnormal tooth)
+    e.g.  "36 DC; 48 I; 26 C"     ("none" if there is no abnormal tooth)
 """
 
 import re
@@ -32,12 +32,14 @@ Write the FDI number and a code, separated by ';':
     I  = impacted tooth
 
 Example:  36 DC; 48 I; 26 C
-Leave the line empty if you see no abnormal tooth.
+Write "none" if you see no abnormal tooth.
 
 Please chart BEFORE looking at the AI results or the DENTEX labels, so the
 comparison is fair (blinded). Take your time, but do not go back to change
 answers after seeing the AI.
 """
+
+_NONE = {"NONE", "NO", "NIL", "-", "0", "NORMAL"}
 
 _WORDS = {"C": "Caries", "CARIES": "Caries", "DC": "Deep Caries", "DEEPCARIES": "Deep Caries",
           "PA": "Periapical Lesion", "PERIAPICAL": "Periapical Lesion",
@@ -49,6 +51,8 @@ def parse_findings(text):
     """'36 DC; 48 I' -> ({(36, 'Deep Caries'), (48, 'Impacted')}, errors)."""
     found, errors = set(), []
     if text is None or (isinstance(text, float) and np.isnan(text)):
+        return found, errors
+    if str(text).strip().upper() in _NONE:
         return found, errors
     for token in re.split(r"[;,\n]+", str(text)):
         token = token.strip()
@@ -79,6 +83,19 @@ def export_study(records, image_dir, out_dir):
                       "reviewed": ["no"] * len(names)}).to_csv(chart, index=False)
     (out / "HOW_TO_CHART.txt").write_text(INSTRUCTIONS)
     return chart
+
+
+def exclude_reviewed(csv_path):
+    """Take X-rays out of the study whose AI results were already shown (keeps the study blind).
+
+    Marks every row currently 'reviewed = yes' as 'excluded'; excluded rows are skipped by
+    the charting tool and by read_chart. Returns the excluded image names.
+    """
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    seen = df["reviewed"].str.lower().isin(["yes", "y", "1", "true", "done"])
+    df.loc[seen, "reviewed"] = "excluded"
+    df.to_csv(csv_path, index=False)
+    return df.loc[seen, "image"].tolist()
 
 
 def read_chart(csv_path):
@@ -166,16 +183,21 @@ def charting_tool(image_dir, csv_path, display_width=2000):
         pass
 
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    state = {"i": next((k for k, v in enumerate(df["reviewed"]) if v.lower() != "yes"), 0)}
+    order = [k for k in range(len(df)) if df.at[k, "reviewed"].lower() != "excluded"]
+    if not order:
+        print("No X-rays left to chart.")
+        return
+    first = next((n for n, k in enumerate(order) if df.at[k, "reviewed"].lower() != "yes"), 0)
+    state = {"pos": first, "last": ""}
     picture = widgets.Image(format="jpeg", layout=widgets.Layout(width="100%"))
-    entry = widgets.Text(placeholder="e.g. 36 DC; 48 I   (C, DC, PA, I) - leave empty if none",
+    entry = widgets.Text(placeholder="e.g. 36 DC; 48 I   (C, DC, PA, I)  -  or 'none'",
                          layout=widgets.Layout(width="60%"))
     status = widgets.HTML()
     back, nxt = widgets.Button(description="< Back"), widgets.Button(description="Save & next >",
                                                                         button_style="primary")
 
     def show():
-        i = state["i"]
+        i = order[state["pos"]]
         img = Image.fromarray((read_xray(Path(image_dir) / df.at[i, "image"]) * 255).astype(np.uint8))
         if img.width > display_width:
             img = img.resize((display_width, round(img.height * display_width / img.width)))
@@ -183,26 +205,33 @@ def charting_tool(image_dir, csv_path, display_width=2000):
         img.save(buf, format="JPEG", quality=92)
         picture.value = buf.getvalue()
         entry.value = df.at[i, "findings"]
-        done = int((df["reviewed"].str.lower() == "yes").sum())
-        status.value = f"<b>X-ray {i + 1} of {len(df)}</b> ({df.at[i, 'image']}) &nbsp; charted so far: {done}/{len(df)}"
+        done = sum(df.at[k, "reviewed"].lower() == "yes" for k in order)
+        status.value = (f"<b>X-ray {state['pos'] + 1} of {len(order)}</b> ({df.at[i, 'image']}) &nbsp; "
+                        f"charted so far: {done}/{len(order)}{state['last']}")
 
     def save():
-        i = state["i"]
-        _, errors = parse_findings(entry.value)
+        i = order[state["pos"]]
+        text = entry.value.strip()
+        if not text:
+            status.value = ("<span style='color:#c00'>Type the findings (e.g. 36 DC; 48 I), "
+                            "or 'none' if this X-ray has no abnormal tooth.</span>")
+            return False
+        _, errors = parse_findings(text)
         if errors:
             status.value = f"<span style='color:#c00'>Could not read: {', '.join(errors)}. Use e.g. 36 DC; 48 I</span>"
             return False
-        df.at[i, "findings"], df.at[i, "reviewed"] = entry.value.strip(), "yes"
+        df.at[i, "findings"], df.at[i, "reviewed"] = text, "yes"
         df.to_csv(csv_path, index=False)
+        state["last"] = f" &nbsp;|&nbsp; saved for {df.at[i, 'image']}: <i>{text}</i>"
         return True
 
     def on_next(_):
         if save():
-            state["i"] = min(state["i"] + 1, len(df) - 1)
+            state["pos"] = min(state["pos"] + 1, len(order) - 1)
             show()
 
     def on_back(_):
-        state["i"] = max(state["i"] - 1, 0)
+        state["pos"] = max(state["pos"] - 1, 0)
         show()
 
     nxt.on_click(on_next)
