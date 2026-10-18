@@ -7,14 +7,14 @@
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/prabhursingh/panoramic-dental-charting/blob/main/notebooks/dental_charting_colab.ipynb)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-Faster%20R--CNN-EE4C2C?logo=pytorch&logoColor=white)
-![Explainability](https://img.shields.io/badge/XAI-Grad--CAM-6a5acd)
+![Explainability](https://img.shields.io/badge/XAI-HiResCAM%20(Grad--CAM%20family)-6a5acd)
 ![Data](https://img.shields.io/badge/data-DENTEX%20(MICCAI%202023)-0B5394)
 ![License](https://img.shields.io/badge/code-MIT-green)
 
 </div>
 
-> **Status:** code complete and tested end-to-end on synthetic data. The training run on the real
-> DENTEX X-rays and the blinded dentist study are in progress; results will be added below.
+> **Status:** models trained and tested on the real DENTEX X-rays (results below). The explanation
+> check and the blinded dentist study are in progress.
 
 ## 📌 Why this project
 
@@ -43,7 +43,7 @@ It is the 2D groundwork for dental AI on 3D intraoral scans, where the same thre
  Panoramic ─────┤                                                        │
   X-ray         └─► Findings model (Faster R-CNN, 4 diagnoses) ──► each finding mapped to its tooth: "36 DC"
                                           │
-                                          └─► Grad-CAM ──► anatomical check: crown (caries) vs apex (periapical lesion)
+                                          └─► HiResCAM ──► anatomical check: crown (caries) vs apex (periapical lesion)
 
  50 blinded study X-rays ──► dentist chart  vs  AI chart  vs  DENTEX ground truth
                               (sensitivity, PPV, Cohen's kappa, AI as a second reader)
@@ -76,8 +76,10 @@ Flipping without relabelling would teach the model the wrong side.
 most. A charted finding counts as correct only if **both** the tooth number and the diagnosis are
 right. The score threshold for findings is chosen on the validation X-rays, never on the test set.
 
-**Explanation check.** For every correctly detected finding, a Grad-CAM heat-map is computed for
-that detection. The tooth box is split into crown half and root half, oriented by jaw (upper teeth
+**Explanation check.** For every correctly detected finding, a heat-map is computed for that
+detection with HiResCAM, a variant of Grad-CAM that multiplies gradients and features point by
+point, so it keeps the exact location of the evidence and does not go blank on the signed FPN
+features of Faster R-CNN. The tooth box is split into crown half and root half, oriented by jaw (upper teeth
 point down on an OPG, lower teeth point up). A heat-map counts as *anatomically plausible* if most
 of it lies in the crown for caries and deep caries, and in the root half for periapical lesions.
 
@@ -88,14 +90,35 @@ are scored against the DENTEX ground truth with sensitivity, PPV and Cohen's kap
 
 ## 📊 Results
 
-*To be added after the training run on the real data.*
+Held-out test sets, never used for training or for choosing thresholds (seed 42, 12 epochs,
+free Colab T4 GPU).
 
-| Question | Metric | Result |
-|---|---|---|
-| Tooth numbering | AP50 · correct FDI number · missing teeth recognised | – |
-| Findings on the chart | precision · recall · F1 (tooth **and** diagnosis correct) | – |
-| Explanation check | heat-map in crown (caries) / root (periapical lesion) | – |
-| Dentist vs AI (50 X-rays) | sensitivity · PPV · kappa, dentist + AI | – |
+**1. Dental chart** (95 test X-rays)
+
+| Metric | Result |
+|---|---|
+| Teeth found (IoU ≥ 0.5) | **99.0 %** |
+| Found teeth with the correct FDI number | **94.1 %** |
+| Tooth positions charted correctly (present / missing) | **95.8 %** |
+| Truly missing teeth recognised | **78.4 %** (of 320) |
+| Detection AP50 / AP | 0.945 / 0.519 |
+
+**2. Findings on the chart** (106 test X-rays; a finding counts only if tooth number **and** diagnosis are right)
+
+| Diagnosis | Precision | Recall | F1 | Box AP50 |
+|---|---:|---:|---:|---:|
+| Impacted | 0.75 | 0.93 | **0.83** | 0.86 |
+| Caries | 0.37 | 0.52 | 0.43 | 0.39 |
+| Deep caries | 0.47 | 0.39 | 0.43 | 0.41 |
+| Periapical lesion | 0.33 | 0.26 | 0.29 | 0.16 |
+| **All** | **0.43** | **0.54** | **0.48** | **0.45** |
+
+Tooth numbering is reliable and impacted teeth are found well. The hard part is the subtle
+findings: separating caries from deep caries (a severity call on which dentists also disagree)
+and small periapical radiolucencies (only 35 in the test set). These are exactly the questions
+the explanation check and the dentist study look at.
+
+**3. Explanation check** and **4. dentist vs AI** (50 blinded X-rays): *in progress.*
 
 ## 🚀 How to run
 
@@ -122,7 +145,7 @@ python -m pytest tests -q          # end-to-end test on fake X-rays, CPU, about 
 │   ├── model.py       # Faster R-CNN (ResNet-50 FPN v2, COCO-pretrained)
 │   ├── train.py       # training loop, resumable checkpoints
 │   ├── evaluate.py    # COCO AP and dental-chart metrics
-│   ├── explain.py     # Grad-CAM for detections + crown/root plausibility check
+│   ├── explain.py     # HiResCAM / Grad-CAM for detections + crown/root plausibility check
 │   ├── agreement.py   # blinded dentist study: charting tool and agreement statistics
 │   └── viz.py         # X-rays with boxes, dental chart, heat-maps, study plots
 ├── scripts/make_synthetic_dentex.py        # fake DENTEX download for testing
